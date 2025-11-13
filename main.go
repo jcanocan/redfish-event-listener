@@ -23,15 +23,17 @@ import (
 )
 
 const (
-	envListenerAddr   = "LISTENER_ADDR"
-	envListenerPort   = "LISTENER_PORT"
-	envDestinationURL = "DESTINATION_URL"
 	envNodeName       = "NODE_NAME"
+	envDestinationURL = "DESTINATION_URL"
 
 	envRedfishURL      = "REDFISH_URL"
 	envRedfishUser     = "REDFISH_USER"
 	envRedfishPass     = "REDFISH_PASS"
 	envRedfishInsecure = "REDFISH_INSECURE"
+
+	addr              = "0.0.0.0:8080"
+	readHeaderTimeout = 10
+	shutdownTimeout   = 5
 )
 
 func main() {
@@ -49,33 +51,29 @@ func run() error {
 	nodeName := lookupEnv(envNodeName)
 	log.Printf("Monitoring node: %s", nodeName)
 
-	redfishClient, err := createRedfishClient()
-	if err != nil {
-		return fmt.Errorf("failed to get Redfish client: %w", err)
-	}
-	defer redfishClient.Logout()
-
-	subscription, err := createSubscription(redfishClient, lookupEnv(envDestinationURL))
+	subscription, err := createSubscription(lookupEnv(envDestinationURL))
 	if err != nil {
 		return fmt.Errorf("failed to create event subscription: %w", err)
 	}
 	log.Printf("Created Redfish event subscription: %s", subscription.ID)
 
-	s := startServer(func(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		log.Printf("Deleting Redfish event subscription: %s", subscription.ID)
+		if err := deleteSubscription(subscription); err != nil {
+			log.Print(err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := startServer(cancel, func(w http.ResponseWriter, r *http.Request) {
 		handleRedfishEvent(w, r, k8sClient, nodeName)
 	})
 
-	quit, _ := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	quit, _ := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	<-quit.Done()
 
-	log.Printf("Deleting Redfish event subscription: %s", subscription.ID)
-	if err := redfish.DeleteEventDestination(redfishClient, subscription.ODataID); err != nil {
-		log.Printf("Failed to delete Redfish event subscription: %v", err)
-	}
-
 	log.Println("Shutting down Redfish event listener")
-	const shutdownTimeout = 5
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout*time.Second)
+	ctx, cancel = context.WithTimeout(context.Background(), shutdownTimeout*time.Second)
 	defer cancel()
 	if err := s.Shutdown(ctx); err != nil {
 		return fmt.Errorf("server shutdown error: %w", err)
@@ -125,7 +123,13 @@ func createRedfishClient() (*gofish.APIClient, error) {
 	return gofish.Connect(config)
 }
 
-func createSubscription(client *gofish.APIClient, destinationURL string) (*redfish.EventDestination, error) {
+func createSubscription(destinationURL string) (*redfish.EventDestination, error) {
+	client, err := createRedfishClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Redfish client: %w", err)
+	}
+	defer client.Logout()
+
 	service, err := client.GetService().EventService()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get EventService: %w", err)
@@ -149,12 +153,21 @@ func createSubscription(client *gofish.APIClient, destinationURL string) (*redfi
 	return dest, nil
 }
 
-func startServer(handler http.HandlerFunc) *http.Server {
-	const (
-		addr              = "0.0.0.0:8080"
-		readHeaderTimeout = 10
-	)
+func deleteSubscription(subscription *redfish.EventDestination) error {
+	client, err := createRedfishClient()
+	if err != nil {
+		return fmt.Errorf("failed to create Redfish client: %w", err)
+	}
+	defer client.Logout()
 
+	if err := redfish.DeleteEventDestination(client, subscription.ODataID); err != nil {
+		return fmt.Errorf("failed to delete event subscription: %w", err)
+	}
+
+	return nil
+}
+
+func startServer(cancel context.CancelFunc, handler http.HandlerFunc) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handler)
 
@@ -167,7 +180,8 @@ func startServer(handler http.HandlerFunc) *http.Server {
 	go func() {
 		log.Printf("Starting Redfish event listener on %s", addr)
 		if err := s.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("HTTP server error: %v", err)
+			log.Printf("HTTP server error: %v", err)
+			cancel()
 		}
 	}()
 
