@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/stmcginnis/gofish"
 	"github.com/stmcginnis/gofish/redfish"
+	"github.com/stmcginnis/gofish/common"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -38,6 +40,17 @@ const (
 	eventContextPrefix = "RedfishEventListener-"
 )
 
+var readWriteSubscriptionFields = []string {
+	"Context",
+	"DeliveryRetryPolicy",
+	"VerifyCertificate",
+	"Destination",
+	"EventTypes",
+	"Protocol",
+	"Oem",
+	"SubscriptionType",
+}
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -53,8 +66,8 @@ type NodeConfig struct {
 }
 
 type nodeInfo struct {
-	nodeConfig   NodeConfig
-	subscription *redfish.EventDestination
+	nodeConfig     NodeConfig
+	subscriptionID string
 }
 
 func run() error {
@@ -86,9 +99,9 @@ func run() error {
 		nodeInfoMapLock.Lock()
 		defer nodeInfoMapLock.Unlock()
 		for _, info := range nodeInfoMap {
-			if info.subscription != nil {
-				log.Printf("Deleting Redfish event subscription: %s", info.subscription.ID)
-				if err := deleteSubscription(info.subscription, &info.nodeConfig); err != nil {
+			if info.subscriptionID != "" {
+				log.Printf("Deleting Redfish event subscription: %s", info.subscriptionID)
+				if err := deleteSubscription(info.subscriptionID, &info.nodeConfig); err != nil {
 					log.Print(err)
 				}
 			}
@@ -146,19 +159,19 @@ func run() error {
 	for _, config := range nodeConfigs {
 		log.Printf("Monitoring node: %s", config.NodeName)
 
-		subscription, err := createSubscription(destinationURL, &config)
+		subscriptionID, err := createSubscription(destinationURL, &config)
 		if err != nil {
 			return fmt.Errorf("failed to create event subscription: %w", err)
 		}
 
 		nodeInfoMapLock.Lock()
 		nodeInfoMap[config.NodeName] = nodeInfo{
-			nodeConfig:   config,
-			subscription: subscription,
+			nodeConfig:     config,
+			subscriptionID: subscriptionID,
 		}
 		nodeInfoMapLock.Unlock()
 
-		log.Printf("Created Redfish event subscription: %s", subscription.ID)
+		log.Printf("Created Redfish event subscription: %s", subscriptionID)
 	}
 
 	grp.Wait()
@@ -294,48 +307,114 @@ func createRedfishClient(nodeConfig *NodeConfig) (*gofish.APIClient, error) {
 	return gofish.Connect(config)
 }
 
-func createSubscription(destinationURL string, nodeConfig *NodeConfig) (*redfish.EventDestination, error) {
+func createSubscription(destinationURL string, nodeConfig *NodeConfig) (string, error) {
 	client, err := createRedfishClient(nodeConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Redfish client: %w", err)
+		return "", fmt.Errorf("failed to create Redfish client: %w", err)
 	}
 	defer client.Logout()
 
 	service, err := client.GetService().EventService()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get EventService: %w", err)
+		return "", fmt.Errorf("failed to get EventService: %w", err)
 	}
 
+	return createEventDestinationInstance(client, service, destinationURL, eventContextPrefix+nodeConfig.NodeName)
+}
+
+func createEventDestinationInstance(client *gofish.APIClient, service *redfish.EventService,
+	destinationURL, subContext string,
+) (string, error) {
+	// Do not use `deliveryRetryPolicy`, it does not work with HPE
 	uri, err := redfish.CreateEventDestinationInstance(
 		client, service.Subscriptions, destinationURL,
 		nil,
 		nil,
 		nil,
 		redfish.RedfishEventDestinationProtocol,
-		eventContextPrefix+nodeConfig.NodeName,
-		redfish.RetryForeverDeliveryRetryPolicy,
+		subContext,
+		"",
 		nil,
 	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create event subscription: %w", err)
+
+	if err == nil {
+		return uri, nil
 	}
 
-	dest, err := redfish.GetEventDestination(client, uri)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get created event subscription: %w", err)
+	var redfishErr *common.Error
+	if ok := errors.As(err, &redfishErr); !ok || redfishErr.HTTPReturnedStatusCode != http.StatusMethodNotAllowed {
+		return "", fmt.Errorf("failed to create event subscription: %w", err)
 	}
 
-	return dest, nil
+	// Fallback, try to get the event subscriptions, in vendors such as SuperMicro H/X12 they have a set of
+	// predefined event subscriptions that are not created by the user
+	return usePredefinedEventDestinationInstance(service, destinationURL, subContext)
 }
 
-func deleteSubscription(subscription *redfish.EventDestination, nodeConfig *NodeConfig) error {
+func usePredefinedEventDestinationInstance(service *redfish.EventService, destinationURL, subContext string)(string, error) {
+	subscriptions, err := service.GetEventSubscriptions()
+	if err != nil {
+		return "", fmt.Errorf("failed to get event subscriptions: %w", err)
+	}
+
+	// Let's find an unused event subscription and use it
+	freeEventSubscription := getFreeEventSubscription(subscriptions)
+
+	if freeEventSubscription == nil {
+		return "", fmt.Errorf("failed to get a free event subscription")
+	}
+
+	modifiedEventSubscription := modifySupermicroEventSubscription(freeEventSubscription, destinationURL, subContext)
+
+	if err := updateEventSubscription(freeEventSubscription, modifiedEventSubscription); err != nil {
+		return "", fmt.Errorf("failed to update event subscription: %w", err)
+	}
+
+	return modifiedEventSubscription.ODataID, nil
+}
+
+func getFreeEventSubscription(subscriptions []*redfish.EventDestination) *redfish.EventDestination {
+	for _, subscription := range subscriptions {
+		if subscription.Destination == "0.0.0.0" || subscription.Destination == "" {
+			return subscription
+		}
+	}
+	return nil
+}
+
+func modifySupermicroEventSubscription(eventSubscription *redfish.EventDestination, destinationURL, subContext string) *redfish.EventDestination {
+	// Create shallow copy of originalEventSubscription, only new values are
+	// assigned to fields below (top-level fields only)
+	newEventSubscription := *eventSubscription
+
+	newEventSubscription.Destination = destinationURL
+	newEventSubscription.Context = subContext
+	newEventSubscription.EventTypes = []redfish.EventType{redfish.AlertEventType}
+	newEventSubscription.Protocol = redfish.RedfishEventDestinationProtocol
+	newEventSubscription.OEM = json.RawMessage(
+		[]byte(`{"Supermicro": {"EnableSubscription": true}}`),
+	)
+	return &newEventSubscription
+}
+
+func updateEventSubscription(originalEventSubscription *redfish.EventDestination,
+	updatedEventSubscription *redfish.EventDestination,
+) error {
+
+	originalElement := reflect.ValueOf(originalEventSubscription).Elem()
+	currentElement := reflect.ValueOf(updatedEventSubscription).Elem()
+
+	return updatedEventSubscription.Entity.Update(originalElement, currentElement, readWriteSubscriptionFields)
+}
+
+func deleteSubscription(subscriptionID string, nodeConfig *NodeConfig) error {
 	client, err := createRedfishClient(nodeConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create Redfish client: %w", err)
 	}
 	defer client.Logout()
 
-	if err := redfish.DeleteEventDestination(client, subscription.ODataID); err != nil {
+	if err := redfish.DeleteEventDestination(client, subscriptionID); err != nil {
 		return fmt.Errorf("failed to delete event subscription: %w", err)
 	}
 
