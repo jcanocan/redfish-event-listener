@@ -2,27 +2,22 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
-	"github.com/stmcginnis/gofish"
+	"github.com/0xfelix/redfish-event-listener/pkg/node"
+	redfishlib "github.com/0xfelix/redfish-event-listener/pkg/redfish"
+	"github.com/0xfelix/redfish-event-listener/pkg/server"
+
 	"github.com/stmcginnis/gofish/redfish"
-	"github.com/stmcginnis/gofish/common"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -32,42 +27,13 @@ const (
 	envDestinationURL  = "DESTINATION_URL"
 	envPodNamespace    = "POD_NAMESPACE"
 	envRedfishInsecure = "REDFISH_INSECURE"
-
-	addr              = "0.0.0.0:8080"
-	readHeaderTimeout = 10
-	shutdownTimeout   = 5
-
 	eventContextPrefix = "RedfishEventListener-"
 )
-
-var readWriteSubscriptionFields = []string {
-	"Context",
-	"DeliveryRetryPolicy",
-	"VerifyCertificate",
-	"Destination",
-	"EventTypes",
-	"Protocol",
-	"Oem",
-	"SubscriptionType",
-}
 
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}
-}
-
-type NodeConfig struct {
-	NodeName string `json:"nodeName"`
-	URL      string `json:"url"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Insecure bool   `json:"insecure,omitempty"`
-}
-
-type nodeInfo struct {
-	nodeConfig     NodeConfig
-	subscriptionID string
 }
 
 func run() error {
@@ -82,7 +48,7 @@ func run() error {
 	}
 
 	dynamicClient, err := dynamic.NewForConfig(k8sConfig)
-	nodeConfigs, err := getNodesConfigFromFARConfig(dynamicClient)
+	nodeConfigs, err := node.GetNodesConfigFromFARConfig(dynamicClient, lookupEnv(envPodNamespace), lookupInsecure())
 	if err != nil {
 		return fmt.Errorf("failed read node configs: %w", err)
 	}
@@ -92,21 +58,21 @@ func run() error {
 	grp := sync.WaitGroup{}
 	defer grp.Wait()
 
-	nodeInfoMap := map[string]nodeInfo{}
+	nodeInfoMap := map[string]node.NodeInfo{}
 	nodeInfoMapLock := sync.RWMutex{}
 
 	defer func() {
 		nodeInfoMapLock.Lock()
 		defer nodeInfoMapLock.Unlock()
 		for _, info := range nodeInfoMap {
-			if info.subscriptionID != "" {
-				log.Printf("Deleting Redfish event subscription: %s", info.subscriptionID)
-				if err := deleteSubscription(info.subscriptionID, &info.nodeConfig); err != nil {
+			if info.SubscriptionID != "" {
+				log.Printf("Deleting Redfish event subscription: %s", info.SubscriptionID)
+				if err := redfishlib.DeleteSubscription(info.SubscriptionID, &info.NodeConfig); err != nil {
 					log.Print(err)
 				}
 			}
 		}
-		nodeInfoMap = map[string]nodeInfo{}
+		nodeInfoMap = map[string]node.NodeInfo{}
 	}()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -139,7 +105,7 @@ func run() error {
 					continue
 				}
 
-				handleEvent(&event, k8sClient, info.nodeConfig.NodeName)
+				server.HandleEvent(&event, k8sClient, info.NodeConfig.NodeName)
 			}
 		}
 	}()
@@ -148,8 +114,8 @@ func run() error {
 	go func() {
 		defer grp.Done()
 		defer close(eventCh)
-		err := runServer(ctx, func(w http.ResponseWriter, r *http.Request) {
-			handleRedfishEvent(w, r, eventCh)
+		err := server.RunServer(ctx, func(w http.ResponseWriter, r *http.Request) {
+			server.HandleRedfishEvent(w, r, eventCh, eventContextPrefix)
 		})
 		if err != nil {
 			log.Printf("Error running server: %v", err)
@@ -159,15 +125,15 @@ func run() error {
 	for _, config := range nodeConfigs {
 		log.Printf("Monitoring node: %s", config.NodeName)
 
-		subscriptionID, err := createSubscription(destinationURL, &config)
+		subscriptionID, err := redfishlib.CreateSubscription(destinationURL, &config, eventContextPrefix+config.NodeName)
 		if err != nil {
 			return fmt.Errorf("failed to create event subscription: %w", err)
 		}
 
 		nodeInfoMapLock.Lock()
-		nodeInfoMap[config.NodeName] = nodeInfo{
-			nodeConfig:     config,
-			subscriptionID: subscriptionID,
+		nodeInfoMap[config.NodeName] = node.NodeInfo{
+			NodeConfig:     config,
+			SubscriptionID: subscriptionID,
 		}
 		nodeInfoMapLock.Unlock()
 
@@ -177,102 +143,6 @@ func run() error {
 	grp.Wait()
 
 	return nil
-}
-
-func getNodesConfigFromFARConfig(client *dynamic.DynamicClient) ([]NodeConfig, error) {
-	namespace := lookupEnv(envPodNamespace)
-
-	objList, err := client.Resource(schema.GroupVersionResource{
-		Group:    "fence-agents-remediation.medik8s.io",
-		Version:  "v1alpha1",
-		Resource: "fenceagentsremediationtemplates",
-	}).Namespace(namespace).List(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list FenceAgentsRemediationTemplates: %w", err)
-	}
-
-	var allNodeConfigs []NodeConfig
-	for _, obj := range objList.Items {
-		if obj.GetNamespace() != namespace {
-			continue
-		}
-
-		agent, found, err := unstructured.NestedString(obj.Object, "spec", "template", "spec", "agent")
-		if err != nil {
-			return nil, fmt.Errorf("failed to get .spec.template.spec.agent: %w", err)
-		}
-		if !found {
-			log.Printf("Skipped FenceAgentsRemediationTemplates \"%s/%s\", no agent is defined.", obj.GetNamespace(), obj.GetName())
-			continue
-		}
-
-		// Ignoring other agents
-		if agent != "fence_ipmilan" {
-			log.Printf("Skipped FenceAgentsRemediationTemplates \"%s/%s\", because its agent is %q", obj.GetNamespace(), obj.GetName(), agent)
-			continue
-		}
-
-		nodeConfigs, err := nodeConfigsFromFar(&obj)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get node config from FenceAgentsRemediationTemplates: %w", err)
-		}
-
-		allNodeConfigs = append(allNodeConfigs, nodeConfigs...)
-	}
-
-	return allNodeConfigs, nil
-}
-
-func nodeConfigsFromFar(obj *unstructured.Unstructured) ([]NodeConfig, error) {
-	nodeParameters, found, err := unstructured.NestedMap(obj.Object, "spec", "template", "spec", "nodeparameters")
-	if err != nil {
-		return nil, fmt.Errorf("failed to get .spec.template.spec.nodeparameters: %w", err)
-	}
-
-	ips, found, err := unstructured.NestedStringMap(nodeParameters, "--ip")
-	if !found {
-		return nil, fmt.Errorf("failed to find '--ip' parameter")
-	}
-	if err != nil {
-		return nil, fmt.Errorf("error getting '--ip' parameter: %w", err)
-	}
-	users, found, err := unstructured.NestedStringMap(nodeParameters, "--username")
-	if !found {
-		return nil, fmt.Errorf("failed to find '--username' parameter")
-	}
-	if err != nil {
-		return nil, fmt.Errorf("error getting '--username' parameter: %w", err)
-	}
-	passwords, found, err := unstructured.NestedStringMap(nodeParameters, "--password")
-	if !found {
-		return nil, fmt.Errorf("failed to find '--password' parameter")
-	}
-	if err != nil {
-		return nil, fmt.Errorf("error getting '--password' parameter: %w", err)
-	}
-
-	var nodeConfigs []NodeConfig
-	for nodeName, ip := range ips {
-		user, ok := users[nodeName]
-		if !ok {
-			log.Printf("FAR config does not specify username for node %q, ignoring the node.", nodeName)
-			continue
-		}
-		password, ok := passwords[nodeName]
-		if !ok {
-			log.Printf("FAR config does not specify password for node %q, ignoring the node.", nodeName)
-			continue
-		}
-		nodeConfigs = append(nodeConfigs, NodeConfig{
-			NodeName: nodeName,
-			URL:      fmt.Sprintf("https://%s", ip),
-			Username: user,
-			Password: password,
-			Insecure: lookupInsecure(),
-		})
-	}
-
-	return nodeConfigs, nil
 }
 
 func lookupEnv(key string) string {
@@ -293,261 +163,4 @@ func lookupInsecure() bool {
 		log.Fatalf("Invalid value %s for environment variable REDFISH_INSECURE", val)
 	}
 	return insecure
-}
-
-func createRedfishClient(nodeConfig *NodeConfig) (*gofish.APIClient, error) {
-	config := gofish.ClientConfig{
-		Endpoint:  nodeConfig.URL,
-		Username:  nodeConfig.Username,
-		Password:  nodeConfig.Password,
-		Insecure:  nodeConfig.Insecure,
-		BasicAuth: true,
-	}
-
-	return gofish.Connect(config)
-}
-
-func createSubscription(destinationURL string, nodeConfig *NodeConfig) (string, error) {
-	client, err := createRedfishClient(nodeConfig)
-	if err != nil {
-		return "", fmt.Errorf("failed to create Redfish client: %w", err)
-	}
-	defer client.Logout()
-
-	service, err := client.GetService().EventService()
-	if err != nil {
-		return "", fmt.Errorf("failed to get EventService: %w", err)
-	}
-
-	return createEventDestinationInstance(client, service, destinationURL, eventContextPrefix+nodeConfig.NodeName)
-}
-
-func createEventDestinationInstance(client *gofish.APIClient, service *redfish.EventService,
-	destinationURL, subContext string,
-) (string, error) {
-	// Do not use `deliveryRetryPolicy`, it does not work with HPE
-	uri, err := redfish.CreateEventDestinationInstance(
-		client, service.Subscriptions, destinationURL,
-		nil,
-		nil,
-		nil,
-		redfish.RedfishEventDestinationProtocol,
-		subContext,
-		"",
-		nil,
-	)
-
-	if err == nil {
-		return uri, nil
-	}
-
-	var redfishErr *common.Error
-	if ok := errors.As(err, &redfishErr); !ok || redfishErr.HTTPReturnedStatusCode != http.StatusMethodNotAllowed {
-		return "", fmt.Errorf("failed to create event subscription: %w", err)
-	}
-
-	// Fallback, try to get the event subscriptions, in vendors such as SuperMicro H/X12 they have a set of
-	// predefined event subscriptions that are not created by the user
-	return usePredefinedEventDestinationInstance(service, destinationURL, subContext)
-}
-
-func usePredefinedEventDestinationInstance(service *redfish.EventService, destinationURL, subContext string)(string, error) {
-	subscriptions, err := service.GetEventSubscriptions()
-	if err != nil {
-		return "", fmt.Errorf("failed to get event subscriptions: %w", err)
-	}
-
-	// Let's find an unused event subscription and use it
-	freeEventSubscription := getFreeEventSubscription(subscriptions)
-
-	if freeEventSubscription == nil {
-		return "", fmt.Errorf("failed to get a free event subscription")
-	}
-
-	modifiedEventSubscription := modifySupermicroEventSubscription(freeEventSubscription, destinationURL, subContext)
-
-	if err := updateEventSubscription(freeEventSubscription, modifiedEventSubscription); err != nil {
-		return "", fmt.Errorf("failed to update event subscription: %w", err)
-	}
-
-	return modifiedEventSubscription.ODataID, nil
-}
-
-func getFreeEventSubscription(subscriptions []*redfish.EventDestination) *redfish.EventDestination {
-	for _, subscription := range subscriptions {
-		if subscription.Destination == "0.0.0.0" || subscription.Destination == "" {
-			return subscription
-		}
-	}
-	return nil
-}
-
-func modifySupermicroEventSubscription(eventSubscription *redfish.EventDestination, destinationURL, subContext string) *redfish.EventDestination {
-	// Create shallow copy of originalEventSubscription, only new values are
-	// assigned to fields below (top-level fields only)
-	newEventSubscription := *eventSubscription
-
-	newEventSubscription.Destination = destinationURL
-	newEventSubscription.Context = subContext
-	newEventSubscription.EventTypes = []redfish.EventType{redfish.AlertEventType}
-	newEventSubscription.Protocol = redfish.RedfishEventDestinationProtocol
-	newEventSubscription.OEM = json.RawMessage(
-		[]byte(`{"Supermicro": {"EnableSubscription": true}}`),
-	)
-	return &newEventSubscription
-}
-
-func updateEventSubscription(originalEventSubscription *redfish.EventDestination,
-	updatedEventSubscription *redfish.EventDestination,
-) error {
-
-	originalElement := reflect.ValueOf(originalEventSubscription).Elem()
-	currentElement := reflect.ValueOf(updatedEventSubscription).Elem()
-
-	return updatedEventSubscription.Entity.Update(originalElement, currentElement, readWriteSubscriptionFields)
-}
-
-func deleteSubscription(subscriptionID string, nodeConfig *NodeConfig) error {
-	client, err := createRedfishClient(nodeConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create Redfish client: %w", err)
-	}
-	defer client.Logout()
-
-	if err := redfish.DeleteEventDestination(client, subscriptionID); err != nil {
-		return fmt.Errorf("failed to delete event subscription: %w", err)
-	}
-
-	return nil
-}
-
-func runServer(ctx context.Context, handler http.HandlerFunc) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", handler)
-
-	s := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: readHeaderTimeout * time.Second,
-	}
-
-	errCh := make(chan error)
-	go func() {
-		defer close(errCh)
-		log.Printf("Starting Redfish event listener on %s", addr)
-		if err := s.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("HTTP server error: %w", err)
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		log.Println("Shutting down Redfish event listener")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout*time.Second)
-		defer cancel()
-		if err := s.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("server shutdown error: %w", err)
-		}
-	case err := <-errCh:
-		return err
-	}
-	return nil
-}
-
-func handleRedfishEvent(w http.ResponseWriter, r *http.Request, eventCh chan<- redfish.Event) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var event redfish.Event
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&event); err != nil {
-		log.Printf("Error decoding event: %v", err)
-		http.Error(w, "Bad request", http.StatusBadRequest)
-		return
-	}
-	defer func() {
-		if err := r.Body.Close(); err != nil {
-			log.Printf("Error closing request body: %v", err)
-		}
-	}()
-
-	if !strings.HasPrefix(event.Context, eventContextPrefix) {
-		log.Printf("Received event with invalid context: %q", event.Context)
-		http.Error(w, "Bad request", http.StatusBadRequest)
-		return
-	}
-
-	eventCh <- event
-
-	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write([]byte("Event received")); err != nil {
-		log.Printf("Error writing response: %v", err)
-	}
-}
-
-func handleEvent(event *redfish.Event, k8sClient *kubernetes.Clientset, nodeName string) {
-	log.Printf("Received Redfish event:")
-	log.Printf("  ID: %s", event.ID)
-	log.Printf("  Name: %s", event.Name)
-	log.Printf("  Context: %s", event.Context)
-	log.Printf("  Number of events: %d", len(event.Events))
-
-	for i, ev := range event.Events {
-		log.Printf("  Event %d:", i+1)
-		log.Printf("    EventType: %s", ev.EventType)
-		log.Printf("    EventID: %s", ev.EventID)
-		log.Printf("    Severity: %s", ev.Severity)
-		log.Printf("    Message: %s", ev.Message)
-		log.Printf("    MessageID: %s", ev.MessageID)
-		log.Printf("    Timestamp: %s", ev.EventTimestamp)
-
-		if strings.Contains(ev.MessageID, "ASR0001") {
-			log.Printf("Detected ASR0001 event, updating node condition for %s", nodeName)
-			if err := updateNodeCondition(k8sClient, nodeName); err != nil {
-				log.Printf("Failed to update node condition: %v", err)
-			} else {
-				log.Printf("Successfully updated node condition for %s", nodeName)
-			}
-		}
-	}
-}
-
-func updateNodeCondition(k8sClient *kubernetes.Clientset, nodeName string) error {
-	const conditionType = "TestCondition"
-
-	node, err := k8sClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to get node: %w", err)
-	}
-
-	now := metav1.Now()
-	newCondition := corev1.NodeCondition{
-		Type:               conditionType,
-		Status:             corev1.ConditionFalse,
-		LastHeartbeatTime:  now,
-		LastTransitionTime: now,
-		Reason:             "EventReceived",
-		Message:            "Redfish event ASR0001 received",
-	}
-
-	conditionExists := false
-	for i, condition := range node.Status.Conditions {
-		if condition.Type == conditionType {
-			node.Status.Conditions[i] = newCondition
-			conditionExists = true
-			break
-		}
-	}
-	if !conditionExists {
-		node.Status.Conditions = append(node.Status.Conditions, newCondition)
-	}
-
-	_, err = k8sClient.CoreV1().Nodes().UpdateStatus(context.Background(), node, metav1.UpdateOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to update node status: %w", err)
-	}
-
-	return nil
 }
