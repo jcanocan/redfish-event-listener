@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/0xfelix/redfish-event-listener/pkg/node"
+	redfishlib "github.com/0xfelix/redfish-event-listener/pkg/redfish"
 
 	"github.com/stmcginnis/gofish/redfish"
 
@@ -110,8 +111,8 @@ func HandleEvent(event *redfish.Event, k8sClient *kubernetes.Clientset, nodeName
 		log.Printf("    MessageID: %s", ev.MessageID)
 		log.Printf("    Timestamp: %s", ev.EventTimestamp)
 
-		if strings.Contains(ev.MessageID, "ASR0001") {
-			log.Printf("Detected ASR0001 event, updating node condition for %s", nodeName)
+		if redfishlib.IsWatchdogResetEvent(ev.MessageID) {
+			log.Printf("Detected watchdog reset event, updating node condition for %s", nodeName)
 			if err := node.UpdateNodeCondition(k8sClient, nodeName); err != nil {
 				log.Printf("Failed to update node condition: %v", err)
 			} else {
