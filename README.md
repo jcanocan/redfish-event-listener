@@ -9,6 +9,8 @@ Listener.
 - Podman or Docker installed locally
 - Access to a container registry (e.g. quay.io)
 - Redfish-enabled server/BMC
+- Node Healthcheck Operator configured
+- Fence Agents Remediation configured
 
 ## Setup Instructions
 
@@ -41,6 +43,8 @@ to be customized:
 cp manifests/pod.yaml.example manifests/pod.yaml
 cp manifests/secret.yaml.example manifests/secret.yaml
 cp manifests/ingress.yaml.example manifests/ingress.yaml
+cp manifests/rbac.yaml.example manifests/rbac.yaml
+cp manifests/service.yaml.example manifests/service.yaml
 ```
 
 **Important:** These files are ignored by git to prevent committing sensitive
@@ -48,26 +52,38 @@ data.
 
 Edit each file and replace the placeholder values:
 
+#### `rbac.yaml`
+
+- `namespace`: Replace `REPLACE_WITH_FAR_NAMESPACE` with the namespace where
+  FAR has been deployed
+
+#### `service.yaml`
+
+- `namespace`: Replace `REPLACE_WITH_FAR_NAMESPACE` with the namespace where
+  FAR has been deployed
+
 #### `secret.yaml`
 
-- `url`: Your Redfish server URL (e.g., `https://10.9.20.153`)
-- `username`: Redfish username
-- `password`: Redfish password
 - `insecure`: Set to `"true"` if using self-signed certificates
 - `destinationURL`: The external URL where Redfish events will be sent (e.g.,
   `https://events.example.com`)
-- `nodeName`: The Kubernetes node name to monitor
+- `namespace`: Replace `REPLACE_WITH_FAR_NAMESPACE` with the namespace where
+  FAR has been deployed
 
 #### `pod.yaml`
 
 - `image`: Replace `REPLACE_WITH_YOUR_IMAGE` with your actual image name
 - Node affinity rule: Replace `REPLACE_WITH_NODE_TO_SCHEDULE_ON` with the
   node you want the Pod to be scheduled on
+- `namespace`: Replace `REPLACE_WITH_FAR_NAMESPACE` with the namespace where
+  FAR has been deployed
 
 #### `ingress.yaml`
 
 - `host`: Replace `REPLACE_WITH_YOUR_EXTERNAL_ROUTE` with your external URL
     - **Important:** This should match the `destinationURL` in `secret.yaml`
+- `namespace`: Replace `REPLACE_WITH_FAR_NAMESPACE` with the namespace where
+  FAR has been deployed
 
 ### 3. Deploy to Kubernetes
 

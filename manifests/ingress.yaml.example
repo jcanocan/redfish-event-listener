@@ -2,7 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: redfish-event-listener
-  namespace: default
+  namespace: REPLACE_WITH_FAR_NAMESPACE
   labels:
     app: redfish-event-listener
 spec:

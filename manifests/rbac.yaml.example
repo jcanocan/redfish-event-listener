@@ -3,6 +3,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: redfish-event-listener
+  namespace: REPLACE_WITH_FAR_NAMESPACE
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -30,4 +31,4 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: redfish-event-listener
-  namespace: REPLACE_WITH_NAMESPACE
+  namespace: REPLACE_WITH_FAR_NAMESPACE

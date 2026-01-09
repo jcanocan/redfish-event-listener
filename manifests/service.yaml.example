@@ -2,6 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: redfish-event-listener
+  namespace: REPLACE_WITH_FAR_NAMESPACE
   labels:
     app: redfish-event-listener
 spec:
