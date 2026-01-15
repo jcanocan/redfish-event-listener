@@ -95,7 +95,7 @@ func HandleRedfishEvent(w http.ResponseWriter, r *http.Request, eventCh chan<- r
 }
 
 // HandleEvent logs the event details and invokes updateNodeCondition when a matching event is detected.
-func HandleEvent(event *redfish.Event, k8sClient *kubernetes.Clientset, nodeName string) {
+func HandleEvent(event *redfish.Event, k8sClient kubernetes.Interface, nodeName string) {
 	log.Printf("Received Redfish event:")
 	log.Printf("  ID: %s", event.ID)
 	log.Printf("  Name: %s", event.Name)
