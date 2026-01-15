@@ -10,10 +10,10 @@ import (
 )
 
 const (
-	conditionType = "TestCondition"
+	ConditionType = "TestCondition"
 )
 
-func UpdateNodeCondition(k8sClient *kubernetes.Clientset, nodeName string) error {
+func UpdateNodeCondition(k8sClient kubernetes.Interface, nodeName string) error {
 	node, err := k8sClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get node: %w", err)
@@ -21,7 +21,7 @@ func UpdateNodeCondition(k8sClient *kubernetes.Clientset, nodeName string) error
 
 	now := metav1.Now()
 	newCondition := corev1.NodeCondition{
-		Type:               conditionType,
+		Type:               ConditionType,
 		Status:             corev1.ConditionFalse,
 		LastHeartbeatTime:  now,
 		LastTransitionTime: now,
@@ -31,7 +31,7 @@ func UpdateNodeCondition(k8sClient *kubernetes.Clientset, nodeName string) error
 
 	conditionExists := false
 	for i, condition := range node.Status.Conditions {
-		if condition.Type == conditionType {
+		if condition.Type == ConditionType {
 			node.Status.Conditions[i] = newCondition
 			conditionExists = true
 			break

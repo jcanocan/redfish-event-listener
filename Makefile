@@ -11,7 +11,7 @@ SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
 
 .PHONY: all
-all: fmt vet lint
+all: fmt vet lint test
 
 .PHONY: fmt
 fmt: gofumpt ## Run gofumpt against code.
@@ -52,3 +52,7 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 gofumpt: $(GOFUMPT) ## Install gofumpt locally if necessary.
 $(GOFUMPT): $(LOCALBIN)
 	GOBIN=$(LOCALBIN) go install mvdan.cc/gofumpt@latest
+
+.PHONY: test
+test: ## Run tests
+	go test -v ./pkg/...
