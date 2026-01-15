@@ -24,7 +24,7 @@ type NodeInfo struct {
 	SubscriptionID string
 }
 
-func GetNodesConfigFromFARConfig(client *dynamic.DynamicClient, namespace string, insecure bool) ([]NodeConfig, error) {
+func GetNodesConfigFromFARConfig(client dynamic.Interface, namespace string, insecure bool) ([]NodeConfig, error) {
 	objList, err := client.Resource(schema.GroupVersionResource{
 		Group:    "fence-agents-remediation.medik8s.io",
 		Version:  "v1alpha1",
