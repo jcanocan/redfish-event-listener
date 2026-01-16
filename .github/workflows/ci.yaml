@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+ 
+      - name: Install Golang
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run unit tests
+        run: make test
+
+  check-commited-files:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Golang
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run make vendor
+        run: make vendor
+      
+      - name: Run make fmt
+        run: make fmt
+
+      - name: check if the tree is clean
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Modified or uncommitted files found"
+            git status --porcelain
+            exit 1
+          fi
