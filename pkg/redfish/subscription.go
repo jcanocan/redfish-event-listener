@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
-
 	"github.com/0xfelix/redfish-event-listener/pkg/node"
 
 	"github.com/stmcginnis/gofish"
