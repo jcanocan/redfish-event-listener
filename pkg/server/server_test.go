@@ -109,34 +109,19 @@ var _ = Describe("Redish event server", func() {
 	})
 
 	Context("watchdog event handling", func() {
+		const nodeName = "node-1"
+
 		DescribeTable("should set or not set a node condition based on watchdog event",
 			func(messageID string, expectCondition bool) {
-				nodeName := "node-1"
-				cs := fake.NewClientset(
-					&corev1.Node{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: nodeName,
-						},
-					},
-				)
-				ev := &redfish.Event{
-					Context: eventContextPrefix + nodeName,
-					Events: []redfish.EventRecord{
-						{
-							EventID:   "sub-1",
-							Message:   "something",
-							MessageID: messageID,
-							Severity:  "OK",
-						},
-					},
-				}
+				cs := createFakeClientSet(nodeName)
+				ev := createEvent(eventContextPrefix+nodeName, messageID)
 
 				server.HandleEvent(ev, cs, nodeName)
 
 				n, err := cs.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
 				Expect(err).NotTo(HaveOccurred())
 
-				condition := getNodeCondition(n.Status.Conditions, node.ConditionType)
+				_, condition := getNodeCondition(n.Status.Conditions, node.ConditionType)
 
 				if expectCondition {
 					Expect(condition).NotTo(BeNil(), "expected TestCondition to be set for watchdog events")
@@ -148,14 +133,74 @@ var _ = Describe("Redish event server", func() {
 			Entry("should not set a node condition for non-watchdog events", "NOT_WATCHDOG", false),
 			Entry("should set a node condition for watchdog events", "ASR0001", true),
 		)
+
+		It("should remove the node condition when the node is recovered", func() {
+			cs := createFakeClientSet(nodeName)
+			ev := createEvent(eventContextPrefix+nodeName, "ASR0001")
+
+			server.HandleEvent(ev, cs, nodeName)
+
+			n, err := cs.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Simulate the node is being rebooted by setting the node to non-ready state
+			n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+				Type:   corev1.NodeReady,
+				Status: corev1.ConditionFalse,
+			})
+
+			n, err = cs.CoreV1().Nodes().UpdateStatus(context.Background(), n, metav1.UpdateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			i, _ := getNodeCondition(n.Status.Conditions, string(corev1.NodeReady))
+			Expect(i).NotTo(Equal(-1))
+
+			// Simulate the node has been recovered by setting the node to ready state
+			n.Status.Conditions[i].Status = corev1.ConditionTrue
+
+			n, err = cs.CoreV1().Nodes().UpdateStatus(context.Background(), n, metav1.UpdateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Wait for the node condition to be removed
+			Eventually(func() bool {
+				n, err := cs.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				_, condition := getNodeCondition(n.Status.Conditions, node.ConditionType)
+				return condition == nil
+			}, 10*time.Second).Should(BeTrue())
+		})
 	})
 })
 
-func getNodeCondition(conditions []corev1.NodeCondition, conditionType string) *corev1.NodeCondition {
-	for _, c := range conditions {
+func createFakeClientSet(nodeName string) *fake.Clientset {
+	return fake.NewClientset(
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: nodeName,
+			},
+		},
+	)
+}
+
+func createEvent(eventContext, messageID string) *redfish.Event {
+	return &redfish.Event{
+		Context: eventContext,
+		Events: []redfish.EventRecord{
+			{
+				EventID:   "sub-1",
+				Message:   "something",
+				MessageID: messageID,
+				Severity:  "OK",
+			},
+		},
+	}
+}
+
+func getNodeCondition(conditions []corev1.NodeCondition, conditionType string) (int, *corev1.NodeCondition) {
+	for i, c := range conditions {
 		if string(c.Type) == conditionType {
-			return &c
+			return i, &c
 		}
 	}
-	return nil
+	return -1, nil
 }

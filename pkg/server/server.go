@@ -115,8 +115,16 @@ func HandleEvent(event *redfish.Event, k8sClient kubernetes.Interface, nodeName 
 			log.Printf("Detected watchdog reset event, updating node condition for %s", nodeName)
 			if err := node.UpdateNodeCondition(k8sClient, nodeName); err != nil {
 				log.Printf("Failed to update node condition: %v", err)
+				return
 			} else {
 				log.Printf("Successfully updated node condition for %s", nodeName)
+			}
+
+			if err := node.CreateNodeConditionRemovalWatcher(k8sClient, nodeName); err != nil {
+				log.Printf("Failed to create ready condition watcher: %v", err)
+				return
+			} else {
+				log.Printf("Successfully created ready condition watcher for %s", nodeName)
 			}
 		}
 	}
