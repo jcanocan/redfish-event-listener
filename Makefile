@@ -1,3 +1,12 @@
+# Override this for development purposes
+IMAGE_REGISTRY ?= quay.io/kubevirt
+
+OPERATOR_NAME ?= redfish-event-listener
+
+IMAGE_TAG ?= latest
+
+IMG ?= $(IMAGE_REGISTRY)/$(OPERATOR_NAME):$(IMAGE_TAG)
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -42,6 +51,13 @@ GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 GOFUMPT ?= $(LOCALBIN)/gofumpt
 
 ## Tool Versions
+.PHONY: build
+build: ## Build the operator image
+	podman build -t ${IMG} .
+
+.PHONY: push
+push: ## Push the operator image
+	podman push ${IMG}
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Install golangci-lint locally if necessary.
